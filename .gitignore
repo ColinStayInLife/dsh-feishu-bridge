@@ -1,0 +1,26 @@
+# 凭据 — 绝不提交
+.env
+*.env
+!.env.example
+credentials*
+*secret*
+*token*
+
+# 运行时状态
+state.json
+daily_report_state.json
+qwen38_ternary_state.json
+bridge.heartbeat
+*.lock
+logs/
+__pycache__/
+*.pyc
+
+# 备份
+*.bak
+*.bak.*
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,26 @@
+[Unit]
+Description=DSH Feishu Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ↓↓↓ 按你的机器改这两行 ↓↓↓
+WorkingDirectory=%h/.dsh/feishu-bridge
+ExecStart=%h/.venvs/feishu-bridge/bin/python %h/.dsh/feishu-bridge/bridge.py
+
+Environment=HOME=%h
+Environment=DSH_API_BASE=http://127.0.0.1:3080
+Environment=DSH_FEISHU_WORKSPACE_ID=CHANGE_ME
+Environment=DSH_FEISHU_TURN_TIMEOUT=900
+Environment=DSH_FEISHU_TURN_HARD_CAP=10800
+Environment=DSH_FEISHU_TABLE_MODE=auto
+Environment=DSH_FEISHU_TABLE_MAX_NATIVE=5
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
