@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 # ↓↓↓ 按你的机器改这两行 ↓↓↓
 WorkingDirectory=%h/.dsh/feishu-bridge
-ExecStart=%h/.venvs/feishu-bridge/bin/python %h/.dsh/feishu-bridge/bridge.py
+ExecStart=%h/.venvs/feishu-bridge/bin/python %h/.dsh/feishu-bridge/bridge_env.py
 
 Environment=HOME=%h
 Environment=DSH_API_BASE=http://127.0.0.1:3080
-Environment=DSH_FEISHU_WORKSPACE_ID=CHANGE_ME
+# workspace id 与飞书凭据一起放在桥目录的 .env；也可通过进程环境覆盖。
 Environment=DSH_FEISHU_TURN_TIMEOUT=900
 Environment=DSH_FEISHU_TURN_HARD_CAP=10800
 Environment=DSH_FEISHU_TABLE_MODE=auto

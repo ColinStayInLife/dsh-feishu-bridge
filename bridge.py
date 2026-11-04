@@ -10,8 +10,13 @@ Feishu cards (no buttons), matching the owner's saved preference.
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl  # POSIX
+except ImportError:  # Windows
+    fcntl = None
+
 import hashlib
+import errno
 import json
 import logging
 import os
@@ -30,7 +35,25 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
-from codex_commands import CodexChannel, is_command as is_codex_command
+from urllib.parse import urlsplit
+try:
+    from codex_commands import CodexChannel, is_command as is_codex_command
+    CODEX_AVAILABLE = True
+except ImportError:  # Windows 未迁移 Codex 桥时的空实现
+    CODEX_AVAILABLE = False
+
+    class CodexChannel:  # noqa: D101
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    def is_codex_command(text):  # noqa: D103
+        return False
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -42,7 +65,10 @@ LOG_PATH = BRIDGE_DIR / "logs" / "bridge.log"
 HEARTBEAT_PATH = BRIDGE_DIR / "bridge.heartbeat"
 # 凭据目录默认 ~/.hermes，可用 FEISHU_ENV_FILE 覆盖
 HERMES_DIR = Path(os.getenv("FEISHU_ENV_DIR", str(Path.home() / ".hermes")))
-HERMES_ENV_PATH = Path(os.getenv("FEISHU_ENV_FILE", str(HERMES_DIR / ".env")))
+HERMES_ENV_PATH = Path(os.getenv(
+    "FEISHU_ENV_FILE",
+    str(BRIDGE_DIR / ".env" if (BRIDGE_DIR / ".env").is_file() else HERMES_DIR / ".env"),
+))
 HERMES_USER_MD = HERMES_DIR / "memories" / "USER.md"
 HERMES_MEMORY_MD = HERMES_DIR / "memories" / "MEMORY.md"
 
@@ -64,6 +90,7 @@ DEFAULT_ALLOWED_SENDERS = ""
 # Logging
 # ---------------------------------------------------------------------------
 
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -98,7 +125,7 @@ def _load_hermes_env() -> Dict[str, str]:
     if not HERMES_ENV_PATH.exists():
         log.warning("Hermes .env not found: %s", HERMES_ENV_PATH)
         return env
-    for raw in HERMES_ENV_PATH.read_text(encoding="utf-8").splitlines():
+    for raw in HERMES_ENV_PATH.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -177,12 +204,33 @@ def _exclusive_chat_lock(chat_id: str):
     message cannot interleave two turns on the same persistent DSH session.
     """
     lock_path = _chat_lock_path(chat_id)
-    with open(lock_path, "a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        else:
+            import msvcrt
+
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            while True:
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _strip_feishu_ats(text: str) -> str:
@@ -453,6 +501,151 @@ def _is_moderation_error(code: str, message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 审批流转（宿主插件 dsh-approval-feishu <-> 飞书）
+# ---------------------------------------------------------------------------
+#
+# 宿主插件截住 approval/request 后，把待办写成 <pipe>/pending/<id>.json，并用
+# 独占创建占住 <pipe>/claim/<id>.json（抢到才算数）。本桥负责：发现新待办 →
+# 发飞书卡片 → 收「批准/拒绝 <id>」→ 写 <pipe>/decisions/<id>.json 回执。
+#
+# 只有盖过归属戳的会话（<pipe>/channels/<sessionId>）插件才接管，所以 Web UI
+# 的会话不会被抢卡片；超时/桥掉线由插件 fail-closed 成拒绝。
+
+_NL = chr(10)
+_APPROVE_RE = re.compile(
+    "[" + re.escape(" /") + r"]*(?:批准|approve|allow|允许|同意)"
+    + r"[" + re.escape(" :：") + r"]*([0-9a-fA-F]{4,16})[" + re.escape(" ") + r"]*$"
+)
+_REJECT_RE = re.compile(
+    "[" + re.escape(" /") + r"]*(?:拒绝|reject|deny|驳回|不允许)"
+    + r"[" + re.escape(" :：") + r"]*([0-9a-fA-F]{4,16})[" + re.escape(" ") + r"]*$"
+)
+
+APPROVAL_POLL_SECONDS = float(os.getenv("FEISHU_APPROVAL_POLL_SECONDS", "1.5"))
+
+
+def _approval_pipe_dir() -> Path:
+    raw = os.getenv("FEISHU_APPROVAL_PIPE_DIR", "").strip()
+    return Path(raw) if raw else Path.home() / ".dsh" / "approvals"
+
+
+def _stamp_session_owner(session_id: str) -> None:
+    """给会话盖上「审批归飞书管」的戳；失败只告警，不影响正常对话。"""
+    if not session_id:
+        return
+    try:
+        folder = _approval_pipe_dir() / "channels"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / session_id).write_text("feishu", encoding="utf-8")
+    except Exception:
+        log.warning("无法写入审批归属戳 session=%s", session_id, exc_info=True)
+
+
+def _approval_keyword_only(text: str) -> str:
+    """用户只写了「批准」/「拒绝」而没带编号时返回关键词，否则空串。"""
+    stripped = (text or "").strip()
+    for keyword in ("批准", "拒绝", "approve", "reject", "allow", "deny", "同意", "驳回"):
+        if stripped.lower() == keyword.lower():
+            return keyword
+    return ""
+
+
+def _looks_like_approval_command(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(_APPROVE_RE.match(stripped) or _REJECT_RE.match(stripped))
+
+
+def _parse_approval_command(text: str):
+    stripped = (text or "").strip()
+    m = _APPROVE_RE.match(stripped)
+    if m:
+        return m.group(1).lower(), "allowed-once"
+    m = _REJECT_RE.match(stripped)
+    if m:
+        return m.group(1).lower(), "rejected"
+    return None, None
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _approval_expired(req: Dict[str, Any], path: Path) -> bool:
+    from datetime import datetime
+
+    try:
+        created = req.get("createdAt")
+        started = datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp() if created else path.stat().st_mtime
+        timeout = float(req.get("timeoutSeconds", 300))
+        return timeout <= 0 or time.time() >= started + timeout
+    except (ValueError, TypeError, OSError):
+        return True
+
+
+def _write_decision(pipe: Path, request_id: str, outcome: str, by: str) -> bool:
+    """原子写裁决文件；失败返回 False，由调用方如实告诉用户。"""
+    decisions = pipe / "decisions"
+    try:
+        decisions.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "type": "approval-decision",
+            "id": request_id,
+            "outcome": outcome,
+            "by": by,
+            "decidedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        target = decisions / (request_id + ".json")
+        tmp = decisions / ("." + request_id + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(target))
+        return True
+    except Exception:
+        log.exception("写审批裁决失败 id=%s", request_id)
+        return False
+
+
+def _read_state_chat_map() -> Dict[str, str]:
+    """session_id -> chat_id（state.json 是 chat -> session 的映射）。"""
+    out: Dict[str, str] = {}
+    try:
+        state = _load_state()
+        for chat_id, item in ((state or {}).get("chats") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            session_id = str(item.get("session_id") or "")
+            if session_id:
+                out[session_id] = str(chat_id)
+    except Exception:
+        log.debug("读取 state.json 失败（审批通知将广播）", exc_info=True)
+    return out
+
+
+def _describe_approval(req: Dict[str, Any]) -> Tuple[str, str]:
+    tool = str(req.get("toolName") or "unknown")
+    reason = str(req.get("reason") or "").strip()
+    command = str(req.get("command") or "").strip()
+    label = {
+        "pwsh": "执行命令（需要提权）",
+        "bash": "执行命令（需要提权）",
+        "str-replace-editor": "修改文件",
+        "fs": "文件写入",
+    }.get(tool, tool)
+    lines = ["请求工具: " + label, "编号: " + str(req.get("id") or "")]
+    if reason:
+        lines.append("原因: " + reason[:400])
+    if req.get("cwd"):
+        lines.append("目录: " + str(req["cwd"]))
+    waited = req.get("timeoutSeconds")
+    if waited:
+        lines.append("超时秒数: " + str(waited) + "（超时自动拒绝）")
+    return label, _NL.join(lines)
+
+
+
+# ---------------------------------------------------------------------------
 # DSH web API client
 # ---------------------------------------------------------------------------
 
@@ -495,37 +688,56 @@ class DshApi:
         )
 
     def _acquire_cookie(self) -> Optional[Tuple[str, str]]:
-        """Exchange the latest `dsh web:` startup token for a session cookie."""
-        token_url: Optional[str] = None
-        try:
-            proc = subprocess.run(
-                ["journalctl", "--user", "-u", "deepseek-harness.service",
-                 "--no-pager", "-n", "200"],
-                capture_output=True, text=True, timeout=15,
-            )
-            urls = re.findall(r"dsh web: (\S+)", proc.stdout)
-            if urls:
-                token_url = urls[-1]
-        except Exception:
-            log.exception("Failed to read harness journal for the dsh web URL")
-            return None
-        if token_url is None:
-            log.warning("No `dsh web:` startup URL in the harness journal")
-            return None
-        jar = CookieJar()
-        opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(jar))
-        try:
-            with opener.open(token_url, timeout=10) as resp:
-                resp.read()
-        except Exception as exc:
-            log.warning("DSH token exchange failed: %s", exc)
-            return None
-        for cookie in jar:
-            if cookie.name.startswith("dsh-auth-"):
-                self._save_cookie((cookie.name, cookie.value))
-                log.info("DSH auth cookie refreshed via token exchange")
-                return (cookie.name, cookie.value)
-        log.warning("DSH token exchange produced no dsh-auth cookie")
+        """从本机 Web 日志交换 Cookie；Windows 无 journalctl。"""
+        sources = []
+        log_paths = [BRIDGE_DIR / "logs" / name for name in ("web_stdout.log", "web.log")]
+        for path in sorted(
+            (p for p in log_paths if p.is_file()),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        ):
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(max(0, path.stat().st_size - 262144))
+                    raw = stream.read()
+                encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
+                sources.append(raw.decode(encoding, errors="replace").replace("\x00", ""))
+            except OSError:
+                log.warning("Cannot read DSH startup log: %s", path)
+        if os.name != "nt":
+            try:
+                proc = subprocess.run(
+                    ["journalctl", "--user", "-u", "deepseek-harness.service",
+                     "--no-pager", "-n", "200"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                sources.append(proc.stdout)
+            except OSError:
+                log.warning("Cannot read DSH startup journal")
+        origin = urlsplit(self.base_url)
+        seen = set()
+        for source in sources:
+            for token_url in reversed(re.findall(r"dsh web: (https?://\S+)", source)):
+                candidate = urlsplit(token_url)
+                if (candidate.scheme, candidate.netloc) != (origin.scheme, origin.netloc):
+                    continue
+                if token_url in seen:
+                    continue
+                seen.add(token_url)
+                jar = CookieJar()
+                opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(jar))
+                try:
+                    with opener.open(token_url, timeout=10) as resp:
+                        resp.read()
+                except Exception as exc:
+                    # 异常文本可能含启动 token，日志仅记异常类型。
+                    log.warning("DSH token exchange failed (%s)", type(exc).__name__)
+                    continue
+                for cookie in jar:
+                    if cookie.name.startswith("dsh-auth-"):
+                        self._save_cookie((cookie.name, cookie.value))
+                        log.info("DSH auth cookie refreshed via token exchange")
+                        return (cookie.name, cookie.value)
+        log.warning("No usable DSH startup URL; check the local Web log")
         return None
 
     def warmup_auth(self) -> None:
@@ -895,6 +1107,69 @@ _TEMPLATE_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("📋", "菜单", "选项", "操作", "命令"), "indigo"),
     (("⏳", "处理中", "进行中", "正在"), "wathet"),
 )
+
+
+# ---------------------------------------------------------------------------
+# 卡片标题：用回复内容概览，而不是固定的 "✅ DeepSeek"
+# ---------------------------------------------------------------------------
+#
+# 用户反馈「每次都只显示 deepseek」→ 标题取回复第一行有内容的文本：
+#   跳过围栏代码块 / 装饰线 / 空行 → 去 markdown 装饰与零宽字符
+#   → 压成一行 → 按句子边界截断到 CARD_TITLE_MAX → 加前缀。
+# 可调：FEISHU_CARD_TITLE_PREFIX（默认 "🤖 "）、FEISHU_CARD_TITLE_MAX（默认 36）、
+#       FEISHU_CARD_TITLE_STYLE=model（回退成固定 "✅ DeepSeek"）。
+
+CARD_TITLE_PREFIX = os.getenv("FEISHU_CARD_TITLE_PREFIX", "\U0001f916 ")
+CARD_TITLE_MAX = int(os.getenv("FEISHU_CARD_TITLE_MAX", "36") or "36")
+CARD_TITLE_STYLE = (os.getenv("FEISHU_CARD_TITLE_STYLE", "content") or "content").strip().lower()
+
+_MD_DECOR_RE = re.compile(r"\*\*|__|`+|~~")
+_MD_HEAD_RE = re.compile(r"^\s*(#{1,6}|>+|[-*+]|\d+\.)\s+")
+_ZW_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_FENCE_ANY_RE = re.compile(r"^\s*(```|~~~)")
+_DECOR_LINE_RE = re.compile(r"[-=_*~#\s|]{3,}")
+
+
+def _reply_card_title(text: str) -> str:
+    """从回复正文提炼一行卡片标题（失败一律回退到固定标题）。"""
+    try:
+        if CARD_TITLE_STYLE == "model":
+            return "✅ DeepSeek"
+        body = _LINK_RE.sub(r"\1", text or "")
+        in_fence = False
+        for raw in body.splitlines():
+            line = raw.strip()
+            if _FENCE_ANY_RE.match(line):
+                in_fence = not in_fence
+                continue
+            if in_fence or not line:
+                continue
+            if _DECOR_LINE_RE.fullmatch(line):
+                continue
+            line = _CTRL_RE.sub("", _ZW_RE.sub("", line))
+            line = _MD_DECOR_RE.sub("", _MD_HEAD_RE.sub("", line)).strip()
+            if not line:
+                continue
+            line = re.sub(r"\s+", " ", line)
+            if len(line) > CARD_TITLE_MAX:
+                limit = CARD_TITLE_MAX
+                cut = -1
+                for ch in "。！？；!?;":
+                    pos = line.rfind(ch, 0, limit)
+                    if pos >= limit // 2:
+                        cut = max(cut, pos)
+                if cut < 0:
+                    for ch in "，,、 ":
+                        pos = line.rfind(ch, 0, limit)
+                        if pos >= limit // 2:
+                            cut = max(cut, pos)
+                line = (line[:cut] if cut > 0 else line[:limit]).rstrip("，,、。.;；:：") + "…"
+            return (CARD_TITLE_PREFIX + line)[:120]
+    except Exception:
+        log.debug("卡片标题生成失败，回退固定标题", exc_info=True)
+    return "✅ DeepSeek"
 
 
 def pick_card_template(title: str, explicit: Optional[str] = None) -> str:
@@ -1414,11 +1689,11 @@ class FeishuSender:
 class Bridge:
     def __init__(self) -> None:
         self.dsh = DshApi()
-        env = _load_hermes_env()
+        env = {**_load_hermes_env(), **os.environ}
         self.app_id = env.get("FEISHU_APP_ID", "").strip()
         self.app_secret = env.get("FEISHU_APP_SECRET", "").strip()
         if not self.app_id or not self.app_secret:
-            raise RuntimeError("FEISHU_APP_ID/FEISHU_APP_SECRET missing from Hermes .env")
+            raise RuntimeError("FEISHU_APP_ID/FEISHU_APP_SECRET missing from environment or bridge .env")
 
         self.allowed_chat_ids = {
             item.strip()
@@ -1439,9 +1714,138 @@ class Bridge:
         self.feishu = FeishuSender(self.app_id, self.app_secret)
         self.codex = CodexChannel(self.feishu, self.allowed_chat_ids)
         self.codex_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="codex-control")
+        self.approval_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="approval-control")
         self.codex.start()
         self.seed_memory_prompt = self._build_seed_memory_prompt()
         log.info("Bridge configured: chats=%s senders=%s", sorted(self.allowed_chat_ids), sorted(self.allowed_senders))
+
+    def _approval_watcher(self) -> None:
+        """后台线程：把新出现的审批请求发到飞书。"""
+        pipe = _approval_pipe_dir()
+        pending_dir = pipe / "pending"
+        log.info("审批监听已启动: %s", pending_dir)
+        while True:
+            try:
+                if pending_dir.is_dir():
+                    for path in sorted(pending_dir.glob("*.json")):
+                        try:
+                            req = _read_json(path)
+                            if not isinstance(req, dict) or not req.get("id"):
+                                continue
+                            if _approval_expired(req, path):
+                                continue
+                            if (pipe / "decisions" / (str(req["id"]) + ".json")).exists():
+                                continue
+                            self._notify_approval(req)
+                        except Exception:
+                            log.exception("处理审批请求失败: %s", path)
+            except Exception:
+                log.exception("审批监听循环异常")
+            time.sleep(APPROVAL_POLL_SECONDS)
+
+    def _notify_approval(self, req: Dict[str, Any]) -> None:
+        request_id = str(req["id"])
+        pipe = _approval_pipe_dir()
+        notice = pipe / "notified" / (request_id + ".json")
+        if notice.exists():
+            return
+        _, detail = _describe_approval(req)
+        session_id = str(req.get("sessionId") or "")
+        chat_ids = []
+        chat_id = _read_state_chat_map().get(session_id)
+        if chat_id:
+            chat_ids.append(chat_id)
+        chat_ids = [cid for cid in chat_ids if cid in self.allowed_chat_ids]
+        if not chat_ids:
+            log.warning("审批请求没有允许的归属聊天 id=%s", request_id)
+            return
+        markdown = _NL.join([
+            "**🔐 有一个操作在等你批准**",
+            "",
+            detail,
+            "",
+            "**怎么回**",
+            "· 批准: 回复 " + "`批准 " + request_id + "`",
+            "· 拒绝: 回复 " + "`拒绝 " + request_id + "`",
+            "（超时不回 = 自动拒绝，不会默认放行）",
+        ])
+        for cid in chat_ids:
+            try:
+                self.feishu.send_card(cid, "🔐 待批准 " + request_id, markdown)
+                notice.parent.mkdir(parents=True, exist_ok=True)
+                notice.write_text(json.dumps({"at": time.time()}), encoding="utf-8")
+                log.info("已发出审批卡片 id=%s chat=%s", request_id, cid)
+            except Exception:
+                log.exception("发审批卡片失败 id=%s chat=%s", request_id, cid)
+
+    def _run_approval_command(self, chat_id: str, message_id: str, text: str) -> None:
+        request_id, outcome = _parse_approval_command(text)
+        if not request_id:
+            return
+        pipe = _approval_pipe_dir()
+        word = "批准" if outcome == "allowed-once" else "拒绝"
+        pending_file = pipe / "pending" / (request_id + ".json")
+        req = _read_json(pending_file) or {}
+        if not req or _approval_expired(req, pending_file) or (pipe / "decisions" / (request_id + ".json")).exists():
+            self.feishu.send_card(
+                chat_id,
+                "⚠️ 找不到这个审批",
+                "编号 `" + request_id + "` 没有待处理记录。" + _NL
+                + "可能已被答复、已超时，或桥重启过。当前待处理 "
+                + str(len(list((pipe / "pending").glob("*.json")))) + " 条。",
+                reply_message_id=message_id,
+            )
+            return
+        owner = _read_state_chat_map().get(str(req.get("sessionId") or ""))
+        if owner != chat_id or chat_id not in self.allowed_chat_ids:
+            self.feishu.send_card(
+                chat_id, "⚠️ 审批归属不符", "这个审批不属于当前聊天，未写入裁决。",
+                reply_message_id=message_id,
+            )
+            return
+        ok = _write_decision(pipe, request_id, outcome, "feishu:" + chat_id)
+        if not ok:
+            self._write_decision_failed_card(chat_id, message_id, request_id)
+            return
+        tool = str(req.get("toolName") or "该操作")
+        self.feishu.send_card(
+            chat_id,
+            "✅ 已" + word + " " + request_id,
+            "**" + word + "** 已回执给宿主（工具: " + tool + "）。" + _NL
+            + "如果这个操作本身还在跑，下一步输出会接着来。",
+            reply_message_id=message_id,
+        )
+        log.info("审批已答复 id=%s outcome=%s", request_id, outcome)
+
+    def _send_approval_hint(self, chat_id: str, message_id: str, keyword: str) -> None:
+        """只写了「批准/拒绝」没带编号时给个格式提示。"""
+        pipe = _approval_pipe_dir()
+        rows = []
+        for path in sorted((pipe / "pending").glob("*.json")):
+            req = _read_json(path)
+            if (isinstance(req, dict) and req.get("id") and not _approval_expired(req, path)
+                    and _read_state_chat_map().get(str(req.get("sessionId") or "")) == chat_id
+                    and not (pipe / "decisions" / (str(req["id"]) + ".json")).exists()):
+                rows.append("`" + str(req["id"]) + "` " + str(req.get("toolName") or ""))
+        markdown = _NL.join([
+            "**要带编号我才能对上号**",
+            "",
+            "格式: " + "`" + keyword + " 编号`",
+            "待处理: " + ("、".join(rows) if rows else "（当前没有待批准的请求）"),
+        ])
+        self.feishu.send_card(chat_id, "ℹ️ 缺审批编号", markdown, reply_message_id=message_id)
+
+    def _write_decision_failed_card(self, chat_id: str, message_id: str, request_id: str) -> None:
+        try:
+            self.feishu.send_card(
+                chat_id,
+                "⚠️ 回执写入失败",
+                "没能把裁决写入审批管道，编号 `" + request_id + "`。" + _NL
+                + "该请求会按超时处理（自动拒绝）。详情见 logs/bridge.log。",
+                reply_message_id=message_id,
+            )
+        except Exception:
+            log.exception("发回执失败卡片失败")
 
     def _build_seed_memory_prompt(self) -> str:
         user_md = _read_file(HERMES_USER_MD) or "(empty)"
@@ -1506,8 +1910,10 @@ class Bridge:
             event_handler=event_handler,
             domain="https://open.feishu.cn",
             auto_reconnect=True,
-            extra_ua_tags=["channel"],
         )
+        threading.Thread(
+            target=self._approval_watcher, name="approval-watcher", daemon=True
+        ).start()
         log.info("Starting Feishu websocket client (app_id=%s...)", self.app_id[:6])
         client.start()
 
@@ -1558,6 +1964,13 @@ class Bridge:
 
             if not self._claim_message(message_id):
                 log.debug("Duplicate Feishu message %s ignored", message_id)
+                return
+
+            # 审批回复不能排在正在等待它的 DSH 轮次后面。
+            if not image_key and (_looks_like_approval_command(text) or _approval_keyword_only(text)):
+                self.approval_executor.submit(
+                    self._handle_message, chat_id, sender_id, message_id, text
+                )
                 return
 
             # Control traffic must bypass the long-running DSH chat lock and pool.
@@ -1678,7 +2091,7 @@ class Bridge:
             f"**FEISHU_ALLOWED_CHAT_IDS**={chat_id}\n\n"
             f"*（本机是 {_hostname()}）*"
         )
-        self.send_card(chat_id, "🔑 首次握手", markdown, note="本条不会转发给 DSH")
+        self.feishu.send_card(chat_id, "🔑 首次握手", markdown, note="本条不会转发给 DSH")
 
     def _send_unsupported_notice(self, chat_id: str, message_id: str, message_type: str) -> None:
         try:
@@ -1699,6 +2112,10 @@ class Bridge:
         text: str,
         image_key: str = "",
     ) -> None:
+        if not image_key and _looks_like_approval_command(text):
+            return self._run_approval_command(chat_id, message_id, text)
+        if not image_key and _approval_keyword_only(text):
+            return self._send_approval_hint(chat_id, message_id, _approval_keyword_only(text))
         lock = self._chat_lock(chat_id)
         with lock:
             try:
@@ -1734,6 +2151,7 @@ class Bridge:
     ) -> None:
             try:
                 session_id, _created = self.dsh.ensure_session(chat_id)
+                _stamp_session_owner(session_id)
                 if not self._is_seeded(session_id):
                     self._seed_memory(chat_id, session_id)
 
@@ -1953,13 +2371,15 @@ class Bridge:
                     final_text = "（正文只有附件，见下条文件消息）"
 
                 model = self.dsh.current_model(session_id)
+                # 卡片标题取回复内容概览（不再一律显示 deepseek）
+                final_title = _reply_card_title(final_text)
                 model_note = f"模型：{model}"
                 if card_id:
                     # 按【表格数量】切分：第一段更新原卡片（保留已读位置），
                     # 其余补发新卡片。这样正文继续用原生表格也不会因超限被整条拒绝。
                     parts = self.feishu._chunks_by_tables(final_text.strip())
                     ok = self.feishu.update_card(
-                        card_id, "✅ DeepSeek", parts[0], note=model_note
+                        card_id, final_title, parts[0], note=model_note
                     )
                     if not ok:
                         # 卡片更新整条失败时此前会静默丢弃内容，用户只看到
@@ -1967,14 +2387,14 @@ class Bridge:
                         log.warning("最终卡片更新失败 chat=%s，改为补发新卡片", chat_id)
                         try:
                             self.feishu.send_card(
-                                chat_id, "✅ DeepSeek", parts[0], note=model_note)
+                                chat_id, final_title, parts[0], note=model_note)
                         except Exception:
                             log.exception("补发卡片也失败 chat=%s（结果未能送达）", chat_id)
                     elif len(parts) > 1:
                         for idx, part in enumerate(parts[1:], 2):
                             try:
                                 self.feishu.send_card(
-                                    chat_id, f"✅ DeepSeek ({idx}/{len(parts)})", part,
+                                    chat_id, f"{final_title} ({idx}/{len(parts)})", part,
                                     note=model_note if idx == len(parts) else None,
                                 )
                             except Exception:
@@ -1983,7 +2403,7 @@ class Bridge:
                 else:
                     self.feishu.send_card(
                         chat_id,
-                        "✅ DeepSeek",
+                        final_title,
                         final_text.strip(),
                         reply_message_id=message_id,
                         note=model_note,
@@ -2049,3 +2469,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

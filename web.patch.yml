@@ -1,0 +1,7 @@
+# DSH 将插件相对路径解析到本补丁文件所在目录。
+- insert:
+    - id: approval-feishu
+      name: ./plugins/approval-feishu.mjs
+      config:
+        timeoutSeconds: 300
+        pollMs: 500
